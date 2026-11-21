@@ -413,6 +413,9 @@ def remove_task(task_id: int, db: Session = Depends(get_db)):
     if meta: db.delete(meta)
     for subtask in db.scalars(select(AcademicSubtask).where(AcademicSubtask.task_id == t.id)):
         db.delete(subtask)
+    db.query(ExamTaskLink).filter_by(task_id=t.id).delete(synchronize_session=False)
+    db.query(StudySession).filter_by(task_id=t.id).update({"task_id":None},synchronize_session=False)
+    db.flush()
     db.delete(t); db.commit()
 
 

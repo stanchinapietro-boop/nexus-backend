@@ -226,3 +226,59 @@ def test_edit_and_export(client):
     assert u.json()["amount_cents"] == 900 and u.json()["category_name"] == "Spesa"
     assert client.put("/api/finance/categories/1", json={"name": "Cibo", "type": "expense", "color": "#222222"}).json()["name"] == "Cibo"
     assert len(client.get("/api/finance/export").json()["transactions"]) == 1
+
+
+def test_finance_ledger_filters_months_and_links(client):
+    api = "/api/finance"
+    account = client.post(f"{api}/accounts", json={"name": "Carta"}).json()["id"]
+    other = client.post(f"{api}/accounts", json={"name": "Risparmio"}).json()["id"]
+    category = client.post(f"{api}/categories", json={"name": "Libri", "type": "expense"}).json()["id"]
+    body = {"type": "expense", "account_id": account, "category_id": category,
+            "day": "2025-11-30", "amount_cents": 395, "note": "Rivista"}
+    entry = client.post(f"{api}/transactions", json=body).json()
+    for change in [{"type": "income"}, {"category_id": 0}, {"amount_cents": 2147483648}, {"note": "x" * 301}]:
+        assert client.post(f"{api}/transactions", json=body | change).status_code == 422
+        assert client.put(f"{api}/transactions/{entry['id']}", json=body | change).status_code == 422
+    assert client.post(f"{api}/transactions", json=body | {"day": "2025-12-01", "account_id": other}).status_code == 201
+    query = {"month": "2025-11", "account_id": account, "category_id": category, "type": "expense", "q": "RIVISTA"}
+    assert client.get(f"{api}/transactions", params=query).json() == [entry]
+    assert client.get(f"{api}/transactions", params=query | {"type": "income"}).json() == []
+    assert client.get(f"{api}/transactions", params=query | {"account_id": other}).json() == []
+    summary = client.get(f"{api}/summary?month=2025-11").json()
+    assert summary["recent"] == [entry] and summary["by_category"][0]["cents"] == 395
+    assert client.get(f"{api}/summary?month=9999-12").status_code == 422
+    assert client.delete(f"{api}/categories/{category}").status_code == 204
+    assert client.get(f"{api}/transactions?month=2025-11").json()[0]["category_id"] is None
+
+
+def test_finance_recurring_dependencies_and_calendar(client):
+    from app.finance import advance
+    from datetime import date
+
+    api = "/api/finance"
+    account = client.post(f"{api}/accounts", json={"name": "Conto"}).json()["id"]
+    category = client.post(f"{api}/categories", json={"name": "Palestra", "type": "expense"}).json()["id"]
+    body = {"type": "expense", "amount_cents": 9, "account_id": account, "category_id": category,
+            "note": "Ricorrenza", "freq": "weekly", "start": "2090-01-01"}
+    assert client.post(f"{api}/recurring", json=body | {"category_id": 999999}).status_code == 422
+    assert client.post(f"{api}/recurring", json=body | {"type": "income"}).status_code == 422
+    rule = client.post(f"{api}/recurring", json=body).json()
+    assert client.delete(f"{api}/categories/{category}").status_code == 409
+    assert client.delete(f"{api}/accounts/{account}").status_code == 409
+    assert client.delete(f"{api}/recurring/{rule['id']}").status_code == 204
+    assert client.delete(f"{api}/categories/{category}").status_code == 204
+    assert client.delete(f"{api}/accounts/{account}").status_code == 204
+    assert advance(date(2024, 1, 31), "monthly", 31) == date(2024, 2, 29)
+    assert advance(date(2024, 2, 29), "monthly", 31) == date(2024, 3, 31)
+    assert advance(date(2024, 2, 29), "yearly", 29) == date(2025, 2, 28)
+    assert advance(date(2025, 12, 30), "weekly", 30) == date(2026, 1, 6)
+
+
+def test_finance_goal_overflow_keeps_balance(client):
+    api = "/api/finance/goals"
+    goal = client.post(api, json={"name": "Riserva", "target_cents": 10000}).json()["id"]
+    endpoint = f"{api}/{goal}/add"
+    assert client.post(endpoint, json={"delta_cents": 2147483647}).status_code == 200
+    assert client.post(endpoint, json={"delta_cents": 1}).status_code == 422
+    assert client.get(api).json()[0]["saved_cents"] == 2147483647
+    assert client.post(endpoint, json={"delta_cents": -2147483648}).json()["saved_cents"] == 0

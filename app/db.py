@@ -10,6 +10,8 @@ load_dotenv()
 
 def _url() -> str:
     url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "sqlite:///./nexus.db"
+    if os.getenv("VERCEL") and not (os.getenv("DATABASE_URL") or "").startswith(("postgres://","postgresql://","postgresql+psycopg://")):
+        raise RuntimeError("La versione cloud richiede DATABASE_URL PostgreSQL")
     for old in ("postgres://", "postgresql://"):
         if url.startswith(old):
             return "postgresql+psycopg://" + url[len(old):]

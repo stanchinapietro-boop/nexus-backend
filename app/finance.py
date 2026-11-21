@@ -1,7 +1,10 @@
+from typing import Literal
 from datetime import date, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Date, ForeignKey, Integer, String, select
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import BigInteger, Boolean, Date, ForeignKey, Integer, String, case, cast, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .db import Base, SessionLocal, get_db
@@ -36,23 +39,29 @@ class Transaction(Base):
     category_id: Mapped[int | None] = mapped_column(ForeignKey("fin_categories.id"), nullable=True)
 
 
-class AccountIn(BaseModel):
+MAX_CENTS = 2_147_483_647
+
+class FinanceInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class AccountIn(FinanceInput):
     name: str = Field(min_length=1, max_length=80)
-    kind: str = "cash"
-    initial_cents: int = 0
+    kind: str = Field(default="cash", min_length=1, max_length=20)
+    initial_cents: int = Field(default=0, ge=-2_147_483_648, le=MAX_CENTS)
 
 
-class CategoryIn(BaseModel):
+class CategoryIn(FinanceInput):
     name: str = Field(min_length=1, max_length=60)
     type: str = Field(pattern="^(expense|income)$")
-    color: str = "#ff6a1a"
+    color: str = Field(default="#ff6a1a", min_length=1, max_length=9)
 
 
 class TxIn(BaseModel):
     type: str = Field(pattern="^(expense|income)$")
-    amount_cents: int = Field(gt=0)
+    amount_cents: int = Field(gt=0, le=MAX_CENTS)
     day: date
-    note: str = ""
+    note: str = Field(default="", max_length=300)
     account_id: int
     category_id: int | None = None
 
@@ -66,6 +75,8 @@ INCOME = [("Stipendio", "#22c55e"), ("Lavoro extra", "#14b8a6"), ("Altro", "#717
 
 def seed():
     with SessionLocal() as db:
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(select(func.pg_advisory_xact_lock(16023014, 3)))
         if db.scalar(select(Category.id).limit(1)) is None:
             db.add_all([Category(name=n, type="expense", color=c) for n, c in EXPENSE])
             db.add_all([Category(name=n, type="income", color=c) for n, c in INCOME])
@@ -102,14 +113,15 @@ def month_range(month: str | None):
     try:
         y, mo = map(int, m.split("-"))
         start = date(y, mo, 1)
+        end = date(y + (mo == 12), mo % 12 + 1, 1)
     except ValueError:
         raise HTTPException(422, "Mese non valido (usa AAAA-MM)")
-    end = date(y + (mo == 12), mo % 12 + 1, 1)
     return start, end
 
 
 @router.get("/accounts")
 def list_accounts(db: Session = Depends(get_db)):
+    process_recurring(db)
     return [acc_out(db, a) for a in db.scalars(select(Account).order_by(Account.id))]
 
 
@@ -121,10 +133,12 @@ def create_account(d: AccountIn, db: Session = Depends(get_db)):
 
 @router.delete("/accounts/{i}", status_code=204)
 def delete_account(i: int, db: Session = Depends(get_db)):
-    a = db.get(Account, i)
+    a = db.get(Account, i, with_for_update=True)
     if not a: raise HTTPException(404, "Conto non trovato")
     if db.scalar(select(Transaction.id).where(Transaction.account_id == i).limit(1)):
         raise HTTPException(409, "Il conto ha dei movimenti: eliminali prima")
+    if db.scalar(select(Recurring.id).where(Recurring.account_id == i).limit(1)):
+        raise HTTPException(409, "Il conto è collegato a una ricorrenza.")
     db.delete(a); db.commit()
 
 
@@ -142,19 +156,30 @@ def create_category(d: CategoryIn, db: Session = Depends(get_db)):
 
 @router.delete("/categories/{i}", status_code=204)
 def delete_category(i: int, db: Session = Depends(get_db)):
-    c = db.get(Category, i)
+    c = db.get(Category, i, with_for_update=True)
     if not c: raise HTTPException(404, "Categoria non trovata")
-    for t in db.scalars(select(Transaction).where(Transaction.category_id == i)):
-        t.category_id = None
+    if db.scalar(select(Budget.id).where(Budget.category_id == i).limit(1)):
+        raise HTTPException(409, "La categoria è usata da un budget.")
+    if db.scalar(select(Recurring.id).where(Recurring.category_id == i).limit(1)):
+        raise HTTPException(409, "La categoria è usata da una ricorrenza.")
+    db.execute(update(Transaction).where(Transaction.category_id == i).values(category_id=None))
     db.delete(c); db.commit()
 
 
 @router.get("/transactions")
-def list_transactions(month: str | None = None, q: str = "", db: Session = Depends(get_db)):
+def list_transactions(month: str | None = None, q: str = "", account_id: int | None = None,
+                      category_id: int | None = None, type: Literal["expense", "income"] | None = None,
+                      db: Session = Depends(get_db)):
     process_recurring(db)
     s, e = month_range(month)
-    rows = db.scalars(select(Transaction).where(Transaction.day >= s, Transaction.day < e)
-                      .order_by(Transaction.day.desc(), Transaction.id.desc())).all()
+    statement = select(Transaction).where(Transaction.day >= s, Transaction.day < e)
+    if account_id is not None:
+        statement = statement.where(Transaction.account_id == account_id)
+    if category_id is not None:
+        statement = statement.where(Transaction.category_id == category_id)
+    if type:
+        statement = statement.where(Transaction.type == type)
+    rows = db.scalars(statement.order_by(Transaction.day.desc(), Transaction.id.desc())).all()
     out = [tx_out(db, t) for t in rows]
     if q:
         ql = q.lower()
@@ -162,10 +187,20 @@ def list_transactions(month: str | None = None, q: str = "", db: Session = Depen
     return out
 
 
+def validate_links(db: Session, account_id: int, category_id: int | None, kind: str):
+    # FOR KEY SHARE allows parallel ledger inserts while protecting parent references.
+    lock = {"read": True, "key_share": True}
+    if not db.get(Account, account_id, with_for_update=lock):
+        raise HTTPException(422, "Conto inesistente")
+    if category_id is not None:
+        category = db.get(Category, category_id, with_for_update=lock)
+        if not category or category.type != kind:
+            raise HTTPException(422, "Scegli una categoria compatibile con il tipo di movimento.")
+
+
 @router.post("/transactions", status_code=201)
 def create_transaction(d: TxIn, db: Session = Depends(get_db)):
-    if not db.get(Account, d.account_id): raise HTTPException(422, "Conto inesistente")
-    if d.category_id and not db.get(Category, d.category_id): raise HTTPException(422, "Categoria inesistente")
+    validate_links(db, d.account_id, d.category_id, d.type)
     t = Transaction(type=d.type, amount_cents=d.amount_cents, day=d.day, note=d.note,
                     account_id=d.account_id, category_id=d.category_id)
     db.add(t); db.commit()
@@ -187,13 +222,13 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
     rows = db.scalars(select(Transaction).where(Transaction.day >= s, Transaction.day < e)).all()
     inc = sum(t.amount_cents for t in rows if t.type == "income")
     exp = sum(t.amount_cents for t in rows if t.type == "expense")
-    cats: dict[str, dict] = {}
+    cats: dict[int | None, dict] = {}
     for t in rows:
         if t.type != "expense": continue
         o = tx_out(db, t)
-        c = cats.setdefault(o["category_name"], {"name": o["category_name"], "color": o["category_color"], "cents": 0})
+        c = cats.setdefault(t.category_id, {"category_id": t.category_id, "name": o["category_name"], "color": o["category_color"], "cents": 0})
         c["cents"] += t.amount_cents
-    recent = db.scalars(select(Transaction).order_by(Transaction.day.desc(), Transaction.id.desc()).limit(5)).all()
+    recent = db.scalars(select(Transaction).where(Transaction.day >= s, Transaction.day < e).order_by(Transaction.day.desc(), Transaction.id.desc()).limit(5)).all()
     return {"balance_cents": sum(a["balance_cents"] for a in accounts), "income_cents": inc,
             "expense_cents": exp, "by_category": sorted(cats.values(), key=lambda c: -c["cents"]),
             "recent": [tx_out(db, t) for t in recent], "accounts": accounts}
@@ -208,12 +243,13 @@ class Budget(Base):
 
 class BudgetIn(BaseModel):
     category_id: int
-    limit_cents: int = Field(gt=0)
+    limit_cents: int = Field(gt=0, le=MAX_CENTS)
 
 
 @router.get("/budgets")
 def list_budgets(month: str | None = None, db: Session = Depends(get_db)):
     s, e = month_range(month)
+    process_recurring(db)
     out = []
     for b in db.scalars(select(Budget).order_by(Budget.id)):
         c = db.get(Category, b.category_id)
@@ -227,12 +263,13 @@ def list_budgets(month: str | None = None, db: Session = Depends(get_db)):
 
 @router.post("/budgets", status_code=201)
 def set_budget(d: BudgetIn, db: Session = Depends(get_db)):
-    c = db.get(Category, d.category_id)
+    c = db.get(Category, d.category_id, with_for_update={"read": True, "key_share": True})
     if not c or c.type != "expense":
         raise HTTPException(422, "Scegli una categoria di spesa")
-    b = db.scalar(select(Budget).where(Budget.category_id == d.category_id))
-    if b: b.limit_cents = d.limit_cents
-    else: db.add(Budget(category_id=d.category_id, limit_cents=d.limit_cents))
+    insert = pg_insert if db.get_bind().dialect.name == "postgresql" else sqlite_insert
+    stmt = insert(Budget).values(category_id=d.category_id, limit_cents=d.limit_cents)
+    db.execute(stmt.on_conflict_do_update(index_elements=[Budget.category_id],
+                                         set_={"limit_cents": d.limit_cents}))
     db.commit()
     return {"ok": True}
 
@@ -247,6 +284,7 @@ def delete_budget(i: int, db: Session = Depends(get_db)):
 @router.get("/report")
 def report(periods: int = 6, db: Session = Depends(get_db)):
     periods = max(1, min(periods, 24))
+    process_recurring(db)
     txs = db.scalars(select(Transaction)).all()
     initial = sum(a.initial_cents for a in db.scalars(select(Account)))
     sign = lambda t: t.amount_cents if t.type == "income" else -t.amount_cents
@@ -256,10 +294,12 @@ def report(periods: int = 6, db: Session = Depends(get_db)):
         y, m = divmod(today.year * 12 + today.month - 1 - i, 12)
         s, e = date(y, m + 1, 1), date(y + (m == 11), (m + 1) % 12 + 1, 1)
         inm = [t for t in txs if s <= t.day < e]
+        account_balance = initial + sum(sign(t) for t in txs if t.day < e)
         out.append({"month": s.strftime("%Y-%m"),
                     "income_cents": sum(t.amount_cents for t in inm if t.type == "income"),
                     "expense_cents": sum(t.amount_cents for t in inm if t.type == "expense"),
-                    "net_worth_cents": initial + sum(sign(t) for t in txs if t.day < e)})
+                    "accounts_balance_cents": account_balance,
+                    "net_worth_cents": account_balance})
     return out
 
 
@@ -286,20 +326,20 @@ class Recurring(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
-class GoalIn(BaseModel):
+class GoalIn(FinanceInput):
     name: str = Field(min_length=1, max_length=80)
-    target_cents: int = Field(gt=0)
+    target_cents: int = Field(gt=0, le=MAX_CENTS)
     deadline: date | None = None
 
 
 class DeltaIn(BaseModel):
-    delta_cents: int
+    delta_cents: int = Field(ge=-2_147_483_648, le=MAX_CENTS)
 
 
-class RecIn(BaseModel):
+class RecIn(FinanceInput):
     note: str = Field(min_length=1, max_length=120)
     type: str = Field(pattern="^(expense|income)$")
-    amount_cents: int = Field(gt=0)
+    amount_cents: int = Field(gt=0, le=MAX_CENTS)
     account_id: int
     category_id: int | None = None
     freq: str = Field(pattern="^(weekly|monthly|yearly)$")
@@ -318,12 +358,25 @@ def advance(d: date, freq: str, anchor: int) -> date:
 
 def process_recurring(db: Session):
     today, made = date.today(), 0
-    for r in db.scalars(select(Recurring).where(Recurring.active == True)):  # noqa: E712
-        while r.next_day <= today and made < 500:
-            db.add(Transaction(type=r.type, amount_cents=r.amount_cents, day=r.next_day, note=r.note,
-                               account_id=r.account_id, category_id=r.category_id))
-            r.next_day = advance(r.next_day, r.freq, r.anchor_day)
-            made += 1
+    due = select(Recurring).where(Recurring.active.is_(True), Recurring.next_day <= today)
+    for r in db.scalars(due.order_by(Recurring.next_day, Recurring.id)):
+        if made >= 500:
+            break
+        cursor = r.next_day
+        dates = []
+        while cursor <= today and made + len(dates) < 500:
+            dates.append(cursor)
+            cursor = advance(cursor, r.freq, r.anchor_day)
+        # The cursor and all its ledger entries are committed together. A second
+        # worker that read the old cursor loses this claim and writes nothing.
+        claim = update(Recurring).where(Recurring.id == r.id, Recurring.active.is_(True),
+                                        Recurring.next_day == r.next_day).values(next_day=cursor)
+        if db.execute(claim.execution_options(synchronize_session=False)).rowcount == 1:
+            for day in dates:
+                db.add(Transaction(type=r.type, amount_cents=r.amount_cents, day=day, note=r.note,
+                                   account_id=r.account_id, category_id=r.category_id))
+            made += len(dates)
+            db.expire(r, ["next_day"])
     db.commit()
 
 
@@ -336,6 +389,7 @@ def rec_out(db, r: Recurring):
     c = db.get(Category, r.category_id) if r.category_id else None
     a = db.get(Account, r.account_id)
     return {"id": r.id, "note": r.note, "type": r.type, "amount_cents": r.amount_cents, "freq": r.freq,
+            "account_id": r.account_id, "category_id": r.category_id, "anchor_day": r.anchor_day,
             "next_day": r.next_day.isoformat(), "active": r.active, "account_name": a.name if a else "",
             "category_name": c.name if c else "Senza categoria"}
 
@@ -353,11 +407,17 @@ def create_goal(d: GoalIn, db: Session = Depends(get_db)):
 
 @router.post("/goals/{i}/add")
 def goal_add(i: int, d: DeltaIn, db: Session = Depends(get_db)):
-    g = db.get(Goal, i)
-    if not g: raise HTTPException(404, "Obiettivo non trovato")
-    g.saved_cents = max(0, g.saved_cents + d.delta_cents)
+    total = cast(Goal.saved_cents, BigInteger) + d.delta_cents
+    stmt = (update(Goal).where(Goal.id == i, total <= MAX_CENTS)
+            .values(saved_cents=case((total < 0, 0), else_=total)).returning(Goal))
+    goal = db.scalar(stmt.execution_options(synchronize_session=False))
+    if goal is None:
+        if not db.get(Goal, i):
+            raise HTTPException(404, "Obiettivo non trovato")
+        raise HTTPException(422, "Importo accumulato troppo elevato.")
+    result = goal_out(goal)
     db.commit()
-    return goal_out(g)
+    return result
 
 
 @router.delete("/goals/{i}", status_code=204)
@@ -375,19 +435,18 @@ def list_recurring(db: Session = Depends(get_db)):
 
 @router.post("/recurring", status_code=201)
 def create_recurring(d: RecIn, db: Session = Depends(get_db)):
-    if not db.get(Account, d.account_id): raise HTTPException(422, "Conto inesistente")
+    validate_links(db, d.account_id, d.category_id, d.type)
     r = Recurring(note=d.note, type=d.type, amount_cents=d.amount_cents, account_id=d.account_id,
                   category_id=d.category_id, freq=d.freq, next_day=d.start, anchor_day=d.start.day)
-    db.add(r); db.commit()
+    db.add(r); db.flush()
     process_recurring(db)
     return rec_out(db, r)
 
 
 @router.post("/recurring/{i}/toggle")
 def toggle_recurring(i: int, db: Session = Depends(get_db)):
-    r = db.get(Recurring, i)
+    r = db.scalar(update(Recurring).where(Recurring.id == i).values(active=~Recurring.active).returning(Recurring))
     if not r: raise HTTPException(404, "Ricorrente non trovato")
-    r.active = not r.active
     db.commit()
     return rec_out(db, r)
 
@@ -403,8 +462,7 @@ def delete_recurring(i: int, db: Session = Depends(get_db)):
 def update_transaction(i: int, d: TxIn, db: Session = Depends(get_db)):
     t = db.get(Transaction, i)
     if not t: raise HTTPException(404, "Movimento non trovato")
-    if not db.get(Account, d.account_id): raise HTTPException(422, "Conto inesistente")
-    if d.category_id and not db.get(Category, d.category_id): raise HTTPException(422, "Categoria inesistente")
+    validate_links(db, d.account_id, d.category_id, d.type)
     t.type, t.amount_cents, t.day, t.note = d.type, d.amount_cents, d.day, d.note
     t.account_id, t.category_id = d.account_id, d.category_id
     db.commit()
@@ -424,6 +482,8 @@ def update_account(i: int, d: AccountIn, db: Session = Depends(get_db)):
 def update_category(i: int, d: CategoryIn, db: Session = Depends(get_db)):
     c = db.get(Category, i)
     if not c: raise HTTPException(404, "Categoria non trovata")
+    if d.type != c.type:
+        raise HTTPException(422, "Il tipo di una categoria esistente è fisso.")
     c.name, c.color = d.name, d.color
     db.commit()
     return {"id": c.id, "name": c.name, "type": c.type, "color": c.color}
@@ -431,6 +491,7 @@ def update_category(i: int, d: CategoryIn, db: Session = Depends(get_db)):
 
 @router.get("/export")
 def export_all(db: Session = Depends(get_db)):
+    process_recurring(db)
     return {
         "exported_at": datetime.now().isoformat(),
         "accounts": [acc_out(db, a) for a in db.scalars(select(Account))],

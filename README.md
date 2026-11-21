@@ -1,10 +1,10 @@
 # NEXUS LIFE OS — backend
 
-API FastAPI pensata per Vercel, con database Postgres (Neon).
+API FastAPI pensata per Vercel, con database PostgreSQL su Supabase.
 La password di accesso non è nel codice: nel database c'è solo il suo hash.
 
 ## Variabili d'ambiente (Vercel → Settings → Environment Variables)
-- `DATABASE_URL`: arriva da sola collegando Neon (Storage).
+- `DATABASE_URL`: URI PostgreSQL del pooler Supabase già configurato nel progetto.
 - `SESSION_SECRET`: stringa casuale di almeno 32 caratteri.
 - `SETUP_CODE`: almeno 16 caratteri casuali, serve solo la prima volta per creare la password.
 - `TICKTICK_TOKEN` e `TICKTICK_TIMEZONE`.
@@ -19,3 +19,7 @@ copy .env.example .env      (compila SESSION_SECRET e SETUP_CODE)
 .venv\Scripts\python -m uvicorn app.main:app --reload
 .venv\Scripts\python -m pytest
 ```
+
+## Milestone 02
+
+Sul database PostgreSQL della Foundation, applicare i file numerati in ordine con `python scripts/migrate_core.py --apply`. Il runner usa la variabile DATABASE_URL del processo e registra i checksum. La Preview serve solo dopo aver aggiornato lo schema.
