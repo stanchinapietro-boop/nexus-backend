@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from . import academic, finance
 from .db import get_db
 from .inbox import InboxItem
+from .life_resources import PersonalGoal
 from .models import Note
 from .projects import Project
 from .events import PersonalEvent
@@ -88,7 +89,9 @@ def sources():
                       (Project.title, Project.description, Project.milestone), lambda i, _: f"/projects?id={i}")
     events = source("Eventi personali", PersonalEvent, PersonalEvent.title, PersonalEvent.location, PersonalEvent.starts_at,
                     (PersonalEvent.title, PersonalEvent.description, PersonalEvent.location), lambda i, _: f"/calendar?evento={i}")
-    return [projects, events, notes, tasks, exams, courses, grades, materials, academic_goals, transactions, savings]
+    personal_goals = source("Obiettivi personali", PersonalGoal, PersonalGoal.title, PersonalGoal.category, PersonalGoal.due_date,
+                            (PersonalGoal.title, PersonalGoal.description, PersonalGoal.category), "/life?tab=obiettivi")
+    return [projects, events, notes, personal_goals, tasks, exams, courses, grades, materials, academic_goals, transactions, savings]
 
 
 def select_matches(adapter, words):

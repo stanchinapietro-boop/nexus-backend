@@ -12,7 +12,7 @@ from . import finance
 from . import academic
 from . import auth
 from . import inbox
-from . import activity, projects, search, events
+from . import activity, projects, search, events, graph
 from . import ticktick
 from .db import Base, engine, get_db
 
@@ -70,6 +70,7 @@ app.include_router(academic.router, dependencies=protected)
 app.include_router(events.router, dependencies=protected)
 app.include_router(projects.router, dependencies=protected)
 app.include_router(activity.router, dependencies=protected)
+app.include_router(graph.router, dependencies=protected)
 app.include_router(search.router, dependencies=protected)
 app.include_router(ticktick.router, dependencies=protected)
 app.include_router(inbox.router, dependencies=protected)

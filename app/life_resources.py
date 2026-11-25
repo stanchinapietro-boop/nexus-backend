@@ -335,6 +335,16 @@ def workouts(db:Session=Depends(get_db)):
 def create_workout(data:WorkoutIn,db:Session=Depends(get_db)):
     row=Workout(**data.model_dump());db.add(row);db.commit();db.refresh(row);return {"id":row.id,**data.model_dump(),"completed":row.completed}
 
+@router.put("/workouts/{workout_id}")
+def update_workout(workout_id: int, data: WorkoutIn, db: Session = Depends(get_db)):
+    row = db.get(Workout, workout_id, with_for_update=True)
+    if row is None:
+        raise HTTPException(404, "Allenamento non trovato")
+    for key, value in data.model_dump().items():
+        setattr(row, key, value)
+    db.commit()
+    return {"id": row.id, **data.model_dump(), "completed": row.completed}
+
 @router.post("/workouts/{workout_id}/complete")
 def complete_workout(workout_id:int,db:Session=Depends(get_db)):
     row=db.get(Workout,workout_id)

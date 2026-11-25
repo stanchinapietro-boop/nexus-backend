@@ -140,3 +140,16 @@ def test_search_activity_and_projects(inbox_client):
     assert client.put(path, json={"title": "Aggiornato", "status": "completed"}).json()["progress"] == 100
     assert client.put(path, json={"title": "Aggiornato", "progress": 120}).status_code == 422
     assert client.delete(path).status_code == 204
+
+
+def test_graph_uses_persisted_conversions(inbox_client):
+    client, _ = inbox_client
+    item = client.post("/api/inbox", json={"title": "Verbale reparto"}).json()
+    assert client.get("/api/graph").json()["connections"] == []
+    result = client.post(f"/api/inbox/{item['id']}/note").json()
+    page = client.get("/api/graph", params={"q": "reparto"}).json()
+    edge, = page["connections"]
+    assert edge["origin"]["path"] == f"/inbox?id={item['id']}"
+    assert edge["destination"]["path"] == f"/knowledge?nota={result['note_id']}"
+    assert page["next_before"] is None
+    assert client.get("/api/graph", params={"before": item["id"]}).json()["connections"] == []
