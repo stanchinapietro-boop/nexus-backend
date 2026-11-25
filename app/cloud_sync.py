@@ -21,7 +21,20 @@ Order = Annotated[list[Entry], Field(max_length=128)]
 Theme = Literal["dark", "midnight", "aurora", "cyberpunk", "matrix", "titanium", "ocean", "minimal", "light", "oled"]
 
 
+Hex = Annotated[str, StringConstraints(pattern=r"^#[0-9a-fA-F]{6}$")]
+Colors = dict[Literal["ink", "panel", "raised", "line", "text", "mute", "sidebar"], Hex]
+
+
+class SavedTheme(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
+    theme: Theme
+    accent: Hex
+    colors: Colors
+
+
 class Appearance(BaseModel):
+    colors: Colors = Field(default_factory=dict)
     model_config = ConfigDict(extra="forbid", strict=True)
     theme: Theme
     accent: Annotated[str, StringConstraints(pattern=r"^#[0-9a-fA-F]{6}$")]
@@ -51,11 +64,17 @@ class PreferenceChange(BaseModel):
 
 @router.patch("/preferences")
 def preferences(body: PreferenceChange, db: Session = Depends(get_db)):
-    allowed = set("profiles activeProfile theme badges quietFrom quietTo accent hiddenTabs hiddenWidgets compactSidebar favoritePaths navOrder recentCommands dashboardOrder dashboardHidden dashboardWide density timeZone clock dateFormat tasksView tasksUrgency".split())
+    allowed = set("savedThemes colors profiles activeProfile theme badges quietFrom quietTo accent hiddenTabs hiddenWidgets compactSidebar favoritePaths navOrder recentCommands dashboardOrder dashboardHidden dashboardWide density timeZone clock dateFormat tasksView tasksUrgency".split())
     patch=json.dumps(body.patch,allow_nan=False)
     if not body.patch or set(body.patch)-allowed or len(patch) > (128000 if "profiles" in body.patch else 16000):
         raise HTTPException(422,"Preferenze non valide")
     try:
+        if "colors" in body.patch:
+            TypeAdapter(Colors).validate_python(body.patch["colors"])
+        if "savedThemes" in body.patch:
+            library = TypeAdapter(Annotated[list[SavedTheme], Field(max_length=24)]).validate_python(body.patch["savedThemes"])
+            if len({t.name for t in library}) != len(library):
+                raise ValueError("duplicate theme name")
         if "theme" in body.patch:
             theme_adapter.validate_python(body.patch["theme"])
         if "profiles" in body.patch:
