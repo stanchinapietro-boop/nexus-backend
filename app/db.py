@@ -4,12 +4,16 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import NullPool
+from .preview_db import validate_preview_target
 
 load_dotenv()
 
 
 def _url() -> str:
     url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "sqlite:///./nexus.db"
+    if os.getenv("VERCEL_ENV") == "preview":
+        validate_preview_target(os.getenv("DATABASE_URL", ""), os.getenv("NEXUS_PREVIEW_SUPABASE_REF", ""),
+                                os.getenv("NEXUS_REAL_SUPABASE_REF", ""))
     if os.getenv("VERCEL") and not (os.getenv("DATABASE_URL") or "").startswith(("postgres://","postgresql://","postgresql+psycopg://")):
         raise RuntimeError("La versione cloud richiede DATABASE_URL PostgreSQL")
     for old in ("postgres://", "postgresql://"):
