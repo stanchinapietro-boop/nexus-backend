@@ -57,7 +57,8 @@ def _stored(db: Session):
 
 
 def _env_token() -> str:
-    return os.getenv("TICKTICK_TOKEN", "").strip()
+    key = "NEXUS_PREVIEW_TICKTICK_TOKEN" if os.getenv("VERCEL_ENV") == "preview" else "TICKTICK_TOKEN"
+    return os.getenv(key, "").strip()
 
 
 def _token(db: Session) -> str:
