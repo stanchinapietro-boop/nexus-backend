@@ -1,5 +1,6 @@
 """Single-user planning metadata; source tasks and events remain in their owning modules."""
 from datetime import date, datetime, timezone
+import os
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -446,14 +447,22 @@ class Advice(Fields):
     items: list[ContextItem] = Field(min_length=1, max_length=80)
 
 
+def assistant_configuration() -> tuple[str, str]:
+    return (os.getenv("NEXUS_AI_BASE_URL", "").strip().rstrip("/"),
+            os.getenv("NEXUS_AI_MODEL", "").strip())
+
+
+@router.get("/assistant/status")
+def assistant_status():
+    return {"configured": all(assistant_configuration())}
+
+
 @router.post("/assistant")
 async def assistant(body: Advice):
-    import os
     import httpx
     if not body.consent:
         raise HTTPException(422, "Serve la conferma per condividere il contesto selezionato.")
-    url = os.environ.get("NEXUS_AI_BASE_URL", "").rstrip("/")
-    model = os.environ.get("NEXUS_AI_MODEL", "")
+    url, model = assistant_configuration()
     if not url or not model:
         raise HTTPException(503, "Il provider AI di NEXUS non è configurato. Il piano locale è disponibile.")
     token = os.environ.get("NEXUS_AI_TOKEN")

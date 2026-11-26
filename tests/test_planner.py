@@ -109,8 +109,11 @@ def test_assistant_sends_only_approved_context(planner_client, monkeypatch):
     import httpx
     from datetime import date
     c, _ = planner_client
+    monkeypatch.delenv("NEXUS_AI_MODEL", raising=False)
+    assert c.get("/api/planner/assistant/status").json() == {"configured": False}
     monkeypatch.setenv("NEXUS_AI_BASE_URL","https://provider.invalid/v1")
     monkeypatch.setenv("NEXUS_AI_MODEL","test-model")
+    assert c.get("/api/planner/assistant/status").json() == {"configured": True}
     monkeypatch.setenv("NEXUS_DESKTOP_AI_ENABLED","1")
     sent=[]
     class Provider:
