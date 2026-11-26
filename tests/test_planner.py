@@ -39,6 +39,30 @@ def planner_client(tmp_path):
 
 
 
+def test_volley_metrics_require_opt_in_and_count_each_observation_once(planner_client, monkeypatch):
+    c, _ = planner_client
+    workout = c.post("/api/life/workouts", json={
+        "name": "Allenamento", "day": "2026-11-26", "sport": "Pallavolo"
+    }).json()["id"]
+    path = f"/api/life/volley/{workout}/metrics"
+    observation = {"id": str(uuid4()), "skill": "serve", "attempts": 10, "successful": 8}
+    monkeypatch.delenv("NEXUS_VOLLEY_METRICS", raising=False)
+    assert c.get("/api/life/volley/capabilities").json() == {"metrics": False}
+    assert c.post(path, json=observation).status_code == 404
+    monkeypatch.setenv("NEXUS_VOLLEY_METRICS", "1")
+    assert c.get(path).json() == []
+    expected = [{"skill": "serve", "attempts": 10, "successful": 8}]
+    for _ in range(2):
+        assert c.post(path, json=observation).json() == expected
+    assert c.post(path, json={**observation, "successful": 9}).status_code == 409
+    assert c.post(path, json={**observation, "successful": 11}).status_code == 422
+    assert c.get(path).json() == expected
+    another = c.post("/api/life/workouts", json={
+        "name": "Corsa", "day": "2026-11-26", "sport": "Corsa"
+    }).json()["id"]
+    assert c.get(f"/api/life/volley/{another}/metrics").status_code == 404
+
+
 def test_dependencies_reject_cycles_and_lost_updates(planner_client):
     c, _ = planner_client
     def put(key, dependencies, version=0):

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import models, notifications, schemas
-from . import life_resources
+from . import life_resources, volley
 from . import cloud_sync, planner
 from . import finance
 from . import academic
@@ -65,6 +65,7 @@ app.include_router(cloud_sync.router, dependencies=protected)
 app.include_router(auth.router)
 app.include_router(planner.router, dependencies=protected)
 app.include_router(life_resources.router, dependencies=protected)
+app.include_router(volley.router, dependencies=protected)
 app.include_router(finance.router, dependencies=protected)
 app.include_router(academic.router, dependencies=protected)
 app.include_router(events.router, dependencies=protected)
