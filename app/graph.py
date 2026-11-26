@@ -1,4 +1,5 @@
-"""Read stored inbox conversions and the records they reference."""
+"""Read explicit relationships between application records."""
+from typing import Literal
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import or_, select
@@ -9,6 +10,7 @@ from .db import get_db
 from .events import PersonalEvent
 from .inbox import InboxItem
 from .models import Note
+from .planner import BlockLink
 from .projects import Project
 
 router = APIRouter(prefix="/api/graph", tags=["graph"])
@@ -33,7 +35,23 @@ class GraphPage(BaseModel):
 
 @router.get("", response_model=GraphPage)
 def graph(q: str = Query("", max_length=100), before: int | None = Query(None, gt=0),
+          relation: Literal["inbox", "project-blocks"] = "inbox",
           db: Session = Depends(get_db)):
+    if relation == "project-blocks":
+        query = (select(PersonalEvent.id, PersonalEvent.title, Project.id, Project.title)
+                 .select_from(BlockLink).join(PersonalEvent, PersonalEvent.id == BlockLink.event_id)
+                 .join(Project, Project.id == BlockLink.project_id))
+        if q:
+            query = query.where(or_(PersonalEvent.title.icontains(q, autoescape=True),
+                                    Project.title.icontains(q, autoescape=True)))
+        if before is not None:
+            query = query.where(BlockLink.event_id < before)
+        rows = db.execute(query.order_by(BlockLink.event_id.desc()).limit(51)).all()
+        return GraphPage(connections=[
+            Connection(origin=Node(key=f"event-{eid}", title=event, kind="Evento", path=f"/calendar?evento={eid}"),
+                       destination=Node(key=f"project-{pid}", title=project, kind="Progetto", path=f"/projects?id={pid}"))
+            for eid, event, pid, project in rows[:50]
+        ], next_before=rows[49][0] if len(rows) > 50 else None)
     targets = (
         (Note, InboxItem.note_id, "Nota", "/knowledge?nota="),
         (Project, InboxItem.project_id, "Progetto", "/projects?id="),
