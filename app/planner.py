@@ -1,6 +1,7 @@
 """Single-user planning metadata; source tasks and events remain in their owning modules."""
 from datetime import date, datetime, timezone
 import os
+from urllib.parse import urlsplit
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -448,8 +449,18 @@ class Advice(Fields):
 
 
 def assistant_configuration() -> tuple[str, str]:
-    return (os.getenv("NEXUS_AI_BASE_URL", "").strip().rstrip("/"),
-            os.getenv("NEXUS_AI_MODEL", "").strip())
+    url = os.getenv("NEXUS_AI_BASE_URL", "").strip().rstrip("/")
+    model = os.getenv("NEXUS_AI_MODEL", "").strip()
+    try:
+        parts = urlsplit(url)
+        local = parts.hostname in {"localhost", "127.0.0.1", "::1"}
+        if (not parts.hostname or parts.username is not None or parts.password is not None
+                or parts.query or parts.fragment or parts.scheme not in ({"https", "http"} if local else {"https"})):
+            return "", ""
+        _ = parts.port  # Validate explicitly configured ports before accepting the URL.
+    except ValueError:
+        return "", ""
+    return url, model
 
 
 @router.get("/assistant/status")

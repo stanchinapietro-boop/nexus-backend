@@ -135,3 +135,32 @@ def test_assistant_sends_only_approved_context(planner_client, monkeypatch):
     approved=json.loads(sent[0]["messages"][1]["content"])
     assert approved["items"]==[{"title":"Preparare il capitolo","source":"Academic","due":None}]
     assert c.get("/api/planner/days/"+body["day"]).json()["version"]==0
+
+
+def test_analytics_preserves_local_dates_at_dst_boundary(planner_client):
+    from datetime import datetime
+    from sqlalchemy.orm import Session
+    from app.models import Note
+    c, engine = planner_client
+    with Session(engine) as db:
+        for stamp in ("2026-03-22T22:59:59+00:00", "2026-03-22T23:00:00+00:00",
+                      "2026-03-29T21:59:59+00:00", "2026-03-29T22:00:00+00:00"):
+            db.add(Note(title="Verifica intervallo", created_at=datetime.fromisoformat(stamp)))
+        db.commit()
+    params = {"end": "2026-03-29", "days": 7, "zone": "Europe/Rome"}
+    response = c.get("/api/analytics", params=params)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["current"] == {"start":"2026-03-23", "end":"2026-03-29",
+                               "notes":2, "events":0, "study":0, "workouts":0}
+    assert data["previous"]["notes"] == 1
+    for override in ({"days":9}, {"zone":"Atlantis/Invalid"}, {"end":"9999-12-31"}):
+        assert c.get("/api/analytics", params=params | override).status_code == 422
+
+
+@pytest.mark.parametrize("url", ["http://provider.invalid/v1", "https://user@provider.invalid",
+                                  "https://provider.invalid/?token=example", "https://provider.invalid:bad"])
+def test_invalid_ai_endpoint_is_unconfigured(planner_client, monkeypatch, url):
+    monkeypatch.setenv("NEXUS_AI_BASE_URL", url)
+    monkeypatch.setenv("NEXUS_AI_MODEL", "test-model")
+    assert planner_client[0].get("/api/planner/assistant/status").json() == {"configured": False}
